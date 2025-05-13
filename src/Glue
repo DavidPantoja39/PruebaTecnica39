@@ -1,0 +1,64 @@
+import boto3
+from urllib.parse import urlparse
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+s3_path = "s3://galactic-services-39/raw/"
+parsed = urlparse(s3_path)
+bucket = parsed.netloc
+prefix = parsed.path.lstrip('/')
+
+s3 = boto3.client('s3')
+
+response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+json_files = [
+    obj["Key"] for obj in response.get("Contents", [])
+    if obj["Key"].endswith(".json")
+]
+
+if not json_files:
+    raise Exception("No se encontraron archivos JSON en la ruta especificada.")
+
+latest_key = sorted(json_files)[-1]
+latest_s3_uri = f"s3://{bucket}/{latest_key}"
+
+print(f"Último archivo encontrado: {latest_s3_uri}")
+
+dyf = glueContext.create_dynamic_frame_from_options(
+    connection_type="s3",
+    format="json",
+    connection_options={"paths": [latest_s3_uri]}
+)
+
+df = dyf.toDF()
+
+df = df.select(F.col("name"), F.col("height"), F.col("mass"), F.col("hair_color"), F.col("skin_color"), F.col("eye_color"), F.col("birth_year"), F.col("gender"))\
+.filter(F.col("mass").cast("Integer")>1000)\
+.witColumn("normalized_birth_year", 2000-F.regexp_replace(F.col("codigo"), "[^0-9]", ""))\
+.witColumn("mass_lb", col("peso_kg") * 2.20462)\
+.witColumn("gender_id",F.when(F.col("gender") == "male", "M").when(F.col("gender") == "female", "F").otherwise("N"))\
+.withColumn(
+    "empty_count",
+    sum(
+        when((col(c).isNull()) | (col(c) == ""), 1).otherwise(0)
+        for c in columns
+    )
+)
+
+df_end = df.filter(col("empty_count") < 3).drop("empty_count")
+
+dyf = DynamicFrame.fromDF(df_end, glueContext, "dyf")
+
+glueContext.write_dynamic_frame.from_options(
+    frame=dyf,
+    connection_type="s3",
+    connection_options={"path": "s3://galactic-services-39/processed/"},
+    format="csv",
+    format_options={"separator": ",", "quoteChar": '"'}
+)
